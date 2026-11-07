@@ -117,24 +117,99 @@ router.post("/posts", auth, upload.single("f"), async (req, res) => {
   const post = await Post.create({ user: req.user._id, text, media: urlFor(req) });
   res.status(201).json({ id: post.id });
 });
+
+
 router.get("/posts", auth, async (req, res) => {
   const filter = {};
-  if (req.query.tag) filter.text = { $regex: `#${String(req.query.tag).replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}`, $options: "i" };
-  const type = req.query.type;
-  let query = Post.find(filter).populate("user");
-  if (type && ["student","business","community"].includes(type)) {
-    const ids = await User.find({ type }).distinct("_id"); filter.user = { $in: ids }; query = Post.find(filter).populate("user");
+
+  if (req.query.tag) {
+    filter.text = {
+      $regex: `#${String(req.query.tag).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+      $options: "i"
+    };
   }
-  const sort = req.query.sort === "oldest" ? { createdAt: 1 } : req.query.sort === "popular" ? { likes: -1, createdAt: -1 } : { createdAt: -1 };
+
+  const type = req.query.type;
+
+  let query = Post.find(filter).populate("user");
+
+  if (type && ["student", "business", "community"].includes(type)) {
+    const ids = await User.find({ type }).distinct("_id");
+
+    filter.user = { $in: ids };
+
+    query = Post.find(filter).populate("user");
+  }
+
+  const sort =
+    req.query.sort === "oldest"
+      ? { createdAt: 1 }
+      : req.query.sort === "popular"
+        ? { likes: -1, createdAt: -1 }
+        : { createdAt: -1 };
+
   const posts = await query.sort(sort).limit(60);
-  res.json(posts.map(p => ({ id: String(p._id), text: p.text, media: p.media, createdAt: p.createdAt, likes: p.likes.length, comments: p.comments.map(c => ({ user: c.username, text: c.text })), user: publicUser(p.user) })));
+
+  res.json(
+    posts.map(p => ({
+      id: String(p._id),
+      text: p.text,
+      media: p.media,
+      createdAt: p.createdAt,
+      likes: p.likes.length,
+
+      // Check whether the logged-in user liked this post.
+      likedByMe: p.likes.some(
+        x => String(x) === String(req.user._id)
+      ),
+
+      comments: p.comments.map(c => ({
+        user: c.username,
+        text: c.text
+      })),
+
+      user: publicUser(p.user)
+    }))
+  );
 });
+
+
+// LIKE / UNLIKE POSTS
 router.post("/posts/:id/like", auth, async (req, res) => {
-  const p = await Post.findById(req.params.id); if (!p) return res.status(404).json({ error: "Post not found." });
-  const i = p.likes.findIndex(x => String(x) === String(req.user._id));
-  if (i < 0) p.likes.push(req.user._id); else p.likes.splice(i,1);
-  await p.save(); res.json({ likes: p.likes.length });
+  const p = await Post.findById(req.params.id);
+
+  if (!p) {
+    return res.status(404).json({
+      error: "Post not found."
+    });
+  }
+
+  // Check whether this user has already liked the post.
+  const i = p.likes.findIndex(
+    x => String(x) === String(req.user._id)
+  );
+
+  // Add the like if it doesn't exist; otherwise remove it.
+  if (i < 0) {
+    p.likes.push(req.user._id);
+  } else {
+    p.likes.splice(i, 1);
+  }
+
+  await p.save();
+
+  // Return the updated like status and count.
+  const likedByMe = p.likes.some(
+    x => String(x) === String(req.user._id)
+  );
+
+  res.json({
+    likes: p.likes.length,
+    likedByMe
+  });
 });
+
+
 router.post("/posts/:id/comments", auth, async (req, res) => {
   const text = clean(req.body?.text); if (!text || text.length > 500) return res.status(400).json({ error: "Comment must be 1–500 characters." });
   const p = await Post.findById(req.params.id); if (!p) return res.status(404).json({ error: "Post not found." });
