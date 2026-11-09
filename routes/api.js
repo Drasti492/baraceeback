@@ -210,11 +210,122 @@ router.post("/posts/:id/like", auth, async (req, res) => {
 });
 
 
+
 router.post("/posts/:id/comments", auth, async (req, res) => {
-  const text = clean(req.body?.text); if (!text || text.length > 500) return res.status(400).json({ error: "Comment must be 1–500 characters." });
-  const p = await Post.findById(req.params.id); if (!p) return res.status(404).json({ error: "Post not found." });
-  p.comments.push({ user: req.user._id, username: req.user.username, text }); await p.save(); res.status(201).json({ ok: true });
+  const text = clean(req.body?.text);
+
+  if (!text || text.length > 500) {
+    return res.status(400).json({
+      error: "Comment must be 1–500 characters."
+    });
+  }
+
+  const p = await Post.findById(req.params.id);
+
+  if (!p) {
+    return res.status(404).json({
+      error: "Post not found."
+    });
+  }
+
+  p.comments.push({
+    user: req.user._id,
+    username: req.user.username,
+    text
+  });
+
+  await p.save();
+
+  await createNotification({
+    recipient: p.user,
+    actor: req.user._id,
+    type: "comment",
+    body: `${req.user.username} commented on your post: ${text.slice(0, 120)}`,
+    post: p._id
+  });
+
+  res.status(201).json({ ok: true });
 });
+
+
+router.post("/messages/:userId", auth, async (req, res) => {
+  const text = clean(req.body?.text);
+
+  if (!text || text.length > 2000) {
+    return res.status(400).json({
+      error: "Message must be 1–2000 characters."
+    });
+  }
+
+  if (String(req.user._id) === req.params.userId) {
+    return res.status(400).json({
+      error: "You cannot message yourself."
+    });
+  }
+
+  const recipient = await User.findById(req.params.userId);
+
+  if (!recipient) {
+    return res.status(404).json({
+      error: "User not found."
+    });
+  }
+
+  const m = await Message.create({
+    from: req.user._id,
+    to: recipient._id,
+    text
+  });
+
+  await createNotification({
+    recipient: recipient._id,
+    actor: req.user._id,
+    type: "message",
+    body: `${req.user.username} sent you a message.`,
+    messageRef: m._id
+  });
+
+  res.status(201).json({ id: m.id });
+});
+
+
+
+router.post("/stories/:id/reply", auth, async (req, res) => {
+  const story = await Story.findById(req.params.id);
+  const text = clean(req.body?.text);
+
+  if (!story || story.expiresAt < new Date()) {
+    return res.status(404).json({
+      error: "Story expired."
+    });
+  }
+
+  if (!text || text.length > 1000) {
+    return res.status(400).json({
+      error: "Enter a reply."
+    });
+  }
+
+  const message = await Message.create({
+    from: req.user._id,
+    to: story.user,
+    text: `Story reply: ${text}`
+  });
+
+  await createNotification({
+    recipient: story.user,
+    actor: req.user._id,
+    type: "story_reply",
+    body: `${req.user.username} replied to your story.`,
+    messageRef: message._id,
+    story: story._id
+  });
+
+  res.json({ ok: true });
+});
+
+
+
 
 router.post("/stories", auth, upload.single("f"), async (req, res) => {
   const text = clean(req.body.text); if (!text && !req.file) return res.status(400).json({ error: "Add text or media." });
@@ -224,12 +335,7 @@ router.get("/stories", auth, async (_req, res) => {
   const rows = await Story.find({ expiresAt: { $gt: new Date() } }).populate("user").sort({ createdAt: -1 }).limit(80);
   res.json(rows.map(s => ({ id: String(s._id), text: s.text, media: s.media, user: publicUser(s.user) })));
 });
-router.post("/stories/:id/reply", auth, async (req, res) => {
-  const story = await Story.findById(req.params.id); const text = clean(req.body?.text);
-  if (!story || story.expiresAt < new Date()) return res.status(404).json({ error: "Story expired." });
-  if (!text || text.length > 1000) return res.status(400).json({ error: "Enter a reply." });
-  await Message.create({ from: req.user._id, to: story.user, text: `Story reply: ${text}` }); res.json({ ok: true });
-});
+
 
 router.post("/listings", auth, upload.single("f"), async (req, res) => {
   const title = clean(req.body.title), price = Number(req.body.price);
@@ -271,12 +377,7 @@ router.get("/messages/:userId", auth, async (req, res) => {
   const rows = await Message.find({ $or: [{ from: req.user._id, to: req.params.userId }, { from: req.params.userId, to: req.user._id }] }).sort({ createdAt: 1 }).limit(200);
   res.json(rows.map(m => ({ from: String(m.from), text: m.text, createdAt: m.createdAt })));
 });
-router.post("/messages/:userId", auth, async (req, res) => {
-  const text = clean(req.body?.text); if (!text || text.length > 2000) return res.status(400).json({ error: "Message must be 1–2000 characters." });
-  if (String(req.user._id) === req.params.userId) return res.status(400).json({ error: "You cannot message yourself." });
-  if (!await User.exists({ _id: req.params.userId })) return res.status(404).json({ error: "User not found." });
-  const m = await Message.create({ from: req.user._id, to: req.params.userId, text }); res.status(201).json({ id: m.id });
-});
+
 router.get("/search", auth, async (req, res) => {
   const q = clean(req.query.q); if (q.length < 2) return res.json({ users: [], posts: [] });
   const rx = new RegExp(q.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&"), "i");
