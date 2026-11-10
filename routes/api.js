@@ -11,6 +11,7 @@ const Post = require("../models/Post");
 const Story = require("../models/Story");
 const Listing = require("../models/Listing");
 const Message = require("../models/Message");
+const Notification = require("../models/Notification");
 const auth = require("../middleware/auth");
 const { makeOtp, hashOtp } = require("../utils/otp");
 const { sendVerificationEmail } = require("../utils/email");
@@ -27,6 +28,28 @@ const urlFor = req => req.file ? `/uploads/${req.file.filename}` : undefined;
 const publicUser = u => ({ id: String(u._id), username: u.username, email: u.email, type: u.type, bizName: u.bizName, verified: u.verified, avatar: u.avatar, online: !!u.online });
 const issueToken = u => jwt.sign({ sub: String(u._id) }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || "30d" });
 const clean = s => String(s || "").trim();
+
+async function createNotification({ recipient, actor, type, body, post, messageRef, story }) {
+  if (!recipient) return;
+
+  // Prevent users from notifying themselves.
+  if (actor && String(recipient) === String(actor)) return;
+
+  try {
+    await Notification.create({
+      recipient,
+      actor,
+      type,
+      body,
+      post,
+      messageRef,
+      story
+    });
+  } catch (error) {
+    // Notification failure must not prevent the main action.
+    console.error("Notification creation failed:", error.message);
+  }
+}
 
 router.post("/auth/signup", async (req, res) => {
   try {
