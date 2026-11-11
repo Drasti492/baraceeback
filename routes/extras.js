@@ -317,7 +317,7 @@ router.post("/stories/:id/reply", auth, async (req, res) => {
 });
 
 /* ---------------- LISTINGS: edit, sold, richer lists ---------------- */
-const shapeListing = l => ({ _id: S(l._id), title: l.title, price: l.price, image: l.image, description: l.description || "", sold: !!l.sold, expiresAt: l.expiresAt, deleteAt: l.deleteAt });
+const shapeListing = l => ({ _id: S(l._id), title: l.title, price: l.price, image: l.image, images: (l.images && l.images.length ? l.images : (l.image ? [l.image] : [])), description: l.description || "", sold: !!l.sold, expiresAt: l.expiresAt, deleteAt: l.deleteAt });
 router.get("/listings", auth, async (req, res) => {
   const q = clean(req.query.q);
   const filter = { expiresAt: { $gt: new Date() }, sold: { $ne: true } };

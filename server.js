@@ -45,6 +45,7 @@ app.use("/uploads", express.static(uploadDir, { maxAge: "1d" }));
 app.use("/api/auth", rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
 
 // extras FIRST (new + fixed routes), then the original routes
+app.use("/api", require("./routes/social")); // auth, profiles, posts, comments, chat, bot
 app.use("/api", require("./routes/extras"));
 app.use("/api", require("./routes/api"));
 
@@ -100,6 +101,11 @@ io.on("connection", async socket => {
   broadcastPresence(user, true);
   socket.emit("socket:ready", { connected: true, userId });
 
+  // Typing indicator relay (client emits {to, typing})
+  socket.on("typing", ({ to, typing } = {}) => {
+    if (/^[a-f0-9]{24}$/i.test(String(to))) io.to(`user:${to}`).emit("typing", { from: userId, typing: !!typing });
+  });
+
   socket.on("disconnect", async () => {
     const c = activeUsers.get(userId);
     if (!c) return;
@@ -124,6 +130,8 @@ if (!process.env.MONGODB_URI || !process.env.JWT_SECRET) {
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => {
     console.log("MongoDB connected");
+    // Accounts that never verified their email must not exist (or hold usernames)
+    User.deleteMany({ emailVerified: false }).then(r => r.deletedCount && console.log(`Removed ${r.deletedCount} unverified account(s)`)).catch(() => {});
     httpServer.listen(port, "0.0.0.0", () => console.log(`Bara Cee API listening on ${port}`));
   })
   .catch(error => { console.error("MongoDB connection failed:", error.message); process.exit(1); });
