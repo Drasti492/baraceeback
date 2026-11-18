@@ -238,8 +238,10 @@ router.get("/threads", auth, async (req, res) => {
   const users = await User.find({ _id: { $in: [...map.keys()] } });
   const out = users.map(u => {
     const t = map.get(S(u._id));
-    const preview = t.last.deletedAt ? "Message deleted" : (t.last.storyReply?.story ? "Story reply" : t.last.text);
-    return { ...publicUser(u), last: preview.slice(0, 40), unread: t.unread, at: t.last.createdAt };
+    const L = t.last;
+    const preview = L.deletedAt ? "Message deleted" : L.storyReply?.story ? "Story reply" : L.media ? (L.viewOnce ? "View-once photo" : (L.text && L.text !== "Photo" ? L.text : "Photo")) : L.text;
+    return { ...publicUser(u), last: preview.slice(0, 50), lastMine: S(L.from) === me, unread: t.unread, at: L.createdAt,
+      lastSeen: u.showLastSeen !== false ? u.lastSeen || null : null };
   }).sort((a, b) => new Date(b.at) - new Date(a.at));
   res.json(out);
 });
