@@ -11,7 +11,7 @@ const Comment = mongoose.model("Comment", new Schema({
   likes: [ref("User")]
 }, { timestamps: true }));
 
-const dSchema = new Schema({ follower: { ...ref("User"), required: true }, following: { ...ref("User"), required: true } }, { timestamps: true });
+const dSchema = new Schema({ follower: { ...ref("User"), required: true }, following: { ...ref("User"), required: true }, status: { type: String, enum: ["pending", "accepted"], default: "accepted" } }, { timestamps: true });
 dSchema.index({ follower: 1, following: 1 }, { unique: true });
 const Disciple = mongoose.model("Disciple", dSchema);
 

@@ -209,9 +209,11 @@ router.patch("/profile", auth, async (req, res) => {
 
 router.patch("/settings", auth, async (req, res) => {
   const b = req.body || {}, u = req.user;
+  const wasPrivate = !!u.lockPosts;
   for (const k of ["showOnlineStatus", "showLastSeen", "showAge", "showEducation", "lockPosts"]) if (typeof b[k] === "boolean") u[k] = b[k];
   if (["light", "dark", "system"].includes(b.theme)) u.theme = b.theme;
   await u.save();
+  if (wasPrivate && !u.lockPosts) await Disciple.updateMany({ following: u._id, status: "pending" }, { $set: { status: "accepted" } });
   res.json(meUser(u));
 });
 
@@ -228,27 +230,31 @@ router.get("/users/:id/profile", auth, async (req, res) => {
   const u = await User.findOne({ _id: req.params.id, emailVerified: true });
   if (!u) return res.status(404).json({ error: "User not found." });
   const me = req.user._id, isMe = S(u._id) === S(me);
-  const [disciples, discipling, posts, agg, mine, iDisciple, iBlocked, blockedMe] = await Promise.all([
-    Disciple.countDocuments({ following: u._id }), Disciple.countDocuments({ follower: u._id }),
+  const [disciples, discipling, posts, agg, mine, rel, iBlocked, blockedMe, pendingIn] = await Promise.all([
+    Disciple.countDocuments({ following: u._id, status: { $ne: "pending" } }), Disciple.countDocuments({ follower: u._id, status: { $ne: "pending" } }),
     Post.countDocuments({ user: u._id }),
     Rating.aggregate([{ $match: { target: u._id } }, { $group: { _id: null, avg: { $avg: "$stars" }, n: { $sum: 1 } } }]),
-    Rating.findOne({ rater: me, target: u._id }), Disciple.exists({ follower: me, following: u._id }),
-    Block.exists({ blocker: me, blocked: u._id }), Block.exists({ blocker: u._id, blocked: me })
+    Rating.findOne({ rater: me, target: u._id }), Disciple.findOne({ follower: me, following: u._id }),
+    Block.exists({ blocker: me, blocked: u._id }), Block.exists({ blocker: u._id, blocked: me }),
+    isMe ? Disciple.countDocuments({ following: me, status: "pending" }) : 0
   ]);
-  const edu = isMe || u.showEducation !== false;
+  const vis = await canView(me, u);
+  const edu = isMe || u.showEducation !== false, hide = !!blockedMe;
   res.json({
-    isMe, iDisciple: !!iDisciple, iBlocked: !!iBlocked, blockedMe: !!blockedMe,
-    locked: !isMe && !!u.lockPosts,
+    isMe, iDisciple: !!rel && rel.status !== "pending", requested: !!rel && rel.status === "pending",
+    iBlocked: !!iBlocked, blockedMe: !!blockedMe, isPrivate: !!u.lockPosts,
+    locked: !vis.ok, lockReason: vis.why || "", requestsCount: pendingIn,
     user: {
-      ...publicUser(u), bio: u.bio || "", stay: u.stay || "", website: u.website || "", hobbies: u.hobbies || "",
-      course: edu ? u.course || "" : "", yearOfStudy: edu ? u.yearOfStudy || "" : "",
-      age: isMe || u.showAge ? u.age || null : null, bizLocation: u.type === "business" ? u.bizLocation || "" : "",
-      joinedAt: u.createdAt, lastSeen: isMe || u.showLastSeen !== false ? u.lastSeen || null : null
+      ...publicUser(u), bio: hide ? "" : u.bio || "", stay: hide ? "" : u.stay || "", website: hide ? "" : u.website || "", hobbies: hide ? "" : u.hobbies || "",
+      course: edu && !hide ? u.course || "" : "", yearOfStudy: edu && !hide ? u.yearOfStudy || "" : "",
+      age: !hide && (isMe || u.showAge) ? u.age || null : null, bizLocation: u.type === "business" && !hide ? u.bizLocation || "" : "",
+      joinedAt: u.createdAt, lastSeen: !hide && (isMe || u.showLastSeen !== false) ? u.lastSeen || null : null, lockPosts: isMe ? !!u.lockPosts : undefined
     },
     stats: { disciples, discipling, posts, rating: { avg: agg[0] ? Math.round(agg[0].avg * 10) / 10 : 0, n: agg[0]?.n || 0, mine: mine?.stars || 0 } }
   });
 });
 
+// Be a disciple / cancel request / unfollow. Private accounts need approval.
 router.post("/users/:id/disciple", auth, async (req, res) => {
   if (!isId(req.params.id) || S(req.user._id) === req.params.id) return res.status(400).json({ error: "Invalid request." });
   const t = await User.findOne({ _id: req.params.id, emailVerified: true });
@@ -257,10 +263,42 @@ router.post("/users/:id/disciple", auth, async (req, res) => {
   if (await Disciple.exists(q)) await Disciple.deleteOne(q);
   else {
     if (await isBlocked(req.user._id, t._id)) return res.status(403).json({ error: "You can't do that with this account." });
-    await Disciple.create(q);
-    await notify(req, { recipient: t._id, actor: req.user._id, type: "follow", body: `${req.user.username} is now your disciple.` });
+    const pending = !!t.lockPosts;
+    await Disciple.create({ ...q, status: pending ? "pending" : "accepted" });
+    await notify(req, { recipient: t._id, actor: req.user._id, type: "follow", body: pending ? `${req.user.username} asked to be your disciple.` : `${req.user.username} is now your disciple.` });
   }
-  res.json({ iDisciple: !!(await Disciple.exists(q)), disciples: await Disciple.countDocuments({ following: t._id }) });
+  const now = await Disciple.findOne(q);
+  res.json({ iDisciple: !!now && now.status !== "pending", requested: !!now && now.status === "pending", disciples: await Disciple.countDocuments({ following: t._id, status: { $ne: "pending" } }) });
+});
+
+// Your disciples (followers) or the people you disciple (following) — own lists only
+router.get("/disciples", auth, async (req, res) => {
+  const followers = req.query.kind !== "following";
+  const q = followers ? { following: req.user._id, status: { $ne: "pending" } } : { follower: req.user._id, status: { $ne: "pending" } };
+  const rows = await Disciple.find(q).populate(followers ? "follower" : "following").sort({ createdAt: -1 }).limit(300);
+  res.json(rows.map(r => (followers ? r.follower : r.following)).filter(Boolean).map(publicUser));
+});
+// Remove someone from your disciples (like removing a follower)
+router.delete("/disciples/:userId", auth, async (req, res) => {
+  if (!isId(req.params.userId)) return res.status(400).json({ error: "Invalid request." });
+  await Disciple.deleteOne({ follower: req.params.userId, following: req.user._id });
+  res.json({ ok: true });
+});
+// Requests to a private account
+router.get("/disciples/requests", auth, async (req, res) => {
+  const rows = await Disciple.find({ following: req.user._id, status: "pending" }).populate("follower").sort({ createdAt: -1 }).limit(100);
+  res.json(rows.map(r => r.follower).filter(Boolean).map(publicUser));
+});
+router.post("/disciples/requests/:userId/accept", auth, async (req, res) => {
+  if (!isId(req.params.userId)) return res.status(400).json({ error: "Invalid request." });
+  const r = await Disciple.findOneAndUpdate({ follower: req.params.userId, following: req.user._id, status: "pending" }, { $set: { status: "accepted" } });
+  if (r) await notify(req, { recipient: r.follower, actor: req.user._id, type: "follow", body: `${req.user.username} accepted your disciple request.` });
+  res.json({ ok: true });
+});
+router.post("/disciples/requests/:userId/decline", auth, async (req, res) => {
+  if (!isId(req.params.userId)) return res.status(400).json({ error: "Invalid request." });
+  await Disciple.deleteOne({ follower: req.params.userId, following: req.user._id, status: "pending" });
+  res.json({ ok: true });
 });
 
 router.post("/users/:id/rate", auth, async (req, res) => {
@@ -316,9 +354,21 @@ async function listPosts(filter, meId, { sort = "new", limit = 60 } = {}) {
   return posts.map(p => shapePost(p, meId, counts));
 }
 const hiddenUsers = async me => {
-  const [blocked, locked] = await Promise.all([Block.find({ blocker: me._id }).distinct("blocked"), User.find({ lockPosts: true, _id: { $ne: me._id } }).distinct("_id")]);
-  return [...blocked, ...locked];
+  const [b1, b2, priv, accepted] = await Promise.all([
+    Block.find({ blocker: me._id }).distinct("blocked"), Block.find({ blocked: me._id }).distinct("blocker"),
+    User.find({ lockPosts: true, _id: { $ne: me._id } }).distinct("_id"),
+    Disciple.find({ follower: me._id, status: { $ne: "pending" } }).distinct("following")
+  ]);
+  const ok = new Set(accepted.map(S));
+  return [...b1, ...b2, ...priv.filter(id => !ok.has(S(id)))];
 };
+// Can `viewerId` see this owner's posts / stories / interact with them?
+async function canView(viewerId, owner) {
+  if (S(owner._id) === S(viewerId)) return { ok: true };
+  if (await isBlocked(viewerId, owner._id)) return { ok: false, why: "blocked" };
+  if (owner.lockPosts && !(await Disciple.exists({ follower: viewerId, following: owner._id, status: { $ne: "pending" } }))) return { ok: false, why: "private" };
+  return { ok: true };
+}
 
 router.get("/posts", auth, async (req, res) => {
   const filter = { user: { $nin: await hiddenUsers(req.user) } };
@@ -331,7 +381,7 @@ router.get("/posts/:id", auth, async (req, res) => {
   if (!isId(req.params.id)) return res.status(404).json({ error: "Post not found." });
   const p = await Post.findById(req.params.id).populate("user");
   if (!p || !p.user) return res.status(404).json({ error: "Post not found." });
-  if (S(p.user._id) !== S(req.user._id) && p.user.lockPosts) return res.status(404).json({ error: "This post is locked." });
+  if (!(await canView(req.user._id, p.user)).ok) return res.status(404).json({ error: "This post isn't available." });
   const counts = new Map([[S(p._id), await Comment.countDocuments({ post: p._id })]]);
   res.json(shapePost(p, req.user._id, counts));
 });
@@ -340,7 +390,8 @@ router.get("/users/:id/posts", auth, async (req, res) => {
   if (!isId(req.params.id)) return res.status(404).json({ error: "User not found." });
   const u = await User.findOne({ _id: req.params.id, emailVerified: true });
   if (!u) return res.status(404).json({ error: "User not found." });
-  if (S(u._id) !== S(req.user._id) && u.lockPosts) return res.json({ locked: true, posts: [] });
+  const vis = await canView(req.user._id, u);
+  if (!vis.ok) return res.json({ locked: true, reason: vis.why, posts: [] });
   res.json({ locked: false, posts: await listPosts({ user: u._id }, req.user._id) });
 });
 
@@ -389,6 +440,8 @@ const shapeComment = (c, meId, replyCount = 0) => ({
 
 router.get("/posts/:id/comments", auth, async (req, res) => {
   if (!isId(req.params.id)) return res.status(404).json({ error: "Post not found." });
+  const vp = await Post.findById(req.params.id).populate("user");
+  if (!vp || !vp.user || !(await canView(req.user._id, vp.user)).ok) return res.status(404).json({ error: "This post isn't available." });
   const skip = Math.max(0, Number(req.query.skip) || 0), limit = Math.min(30, Math.max(1, Number(req.query.limit) || 20));
   const q = { post: req.params.id, parent: null };
   const [rows, total] = await Promise.all([Comment.find(q).populate("user").populate("replyToUser", "username").sort({ createdAt: -1 }).skip(skip).limit(limit), Comment.countDocuments(q)]);
@@ -409,7 +462,9 @@ router.post("/posts/:id/comments", auth, async (req, res) => {
   if (!text || text.length > 500) return res.status(400).json({ error: "Comment must be 1–500 characters." });
   const post = await Post.findById(req.params.id);
   if (!post) return res.status(404).json({ error: "Post not found." });
-  if (await Block.exists({ blocker: post.user, blocked: req.user._id })) return res.status(403).json({ error: "You can't comment on this person's posts." });
+  const owner = await User.findById(post.user);
+  const vis = owner && await canView(req.user._id, owner);
+  if (!vis || !vis.ok) return res.status(403).json({ error: vis && vis.why === "blocked" ? "You can't comment on this person's posts." : "Only this account's disciples can interact with its posts." });
   let parent = null, replyToUser;
   if (req.body?.replyToComment) {
     const target = isId(req.body.replyToComment) ? await Comment.findOne({ _id: req.body.replyToComment, post: post._id }) : null;
@@ -446,8 +501,7 @@ router.delete("/comments/:id", auth, async (req, res) => {
 
 /* ================= STORIES / LISTINGS (persistent uploads) ================= */
 router.get("/stories", auth, async (req, res) => {
-  const blocked = await Block.find({ blocker: req.user._id }).distinct("blocked");
-  const rows = await Story.find({ expiresAt: { $gt: new Date() }, user: { $nin: blocked } }).populate("user").sort({ createdAt: 1 }).limit(200);
+  const rows = await Story.find({ expiresAt: { $gt: new Date() }, user: { $nin: await hiddenUsers(req.user) } }).populate("user").sort({ createdAt: 1 }).limit(200);
   res.json(rows.filter(s => s.user).map(s => ({ id: S(s._id), text: s.text, media: s.media, createdAt: s.createdAt, user: publicUser(s.user) })));
 });
 router.post("/stories", auth, upload.single("f"), async (req, res) => {
@@ -594,7 +648,7 @@ router.post("/ai", auth, async (req, res) => {
   const bare = !m && /^[a-z0-9_.]{3,20}$/.test(lower) ? lower : null;
   if ((scope === "all" || scope === "people" || scope === "posts") && (m || bare)) {
     const u = await User.findOne({ username: m ? m[1] : bare, emailVerified: true });
-    if (u) {
+    if (u && !(await isBlocked(me, u._id))) {
       const [disc, agg, count] = await Promise.all([Disciple.countDocuments({ following: u._id }), Rating.aggregate([{ $match: { target: u._id } }, { $group: { _id: null, avg: { $avg: "$stars" }, n: { $sum: 1 } } }]), Post.countDocuments({ user: u._id })]);
       const isMe = S(u._id) === S(me), edu = isMe || u.showEducation !== false;
       const bits = [`@${u.username} is a ${u.type}${u.verified ? " (verified)" : ""}.`];
@@ -605,7 +659,7 @@ router.post("/ai", auth, async (req, res) => {
       if (isMe || u.showAge) if (u.age) bits.push(`Age ${u.age}.`);
       bits.push(`${disc} disciple${disc === 1 ? "" : "s"}, ${count} post${count === 1 ? "" : "s"}${agg[0] ? `, rated ${Math.round(agg[0].avg * 10) / 10}/5 by ${agg[0].n}` : ""}.`);
       let results = [userCard(u)];
-      if (u.lockPosts && !isMe) bits.push("Their posts are locked.");
+      if (!isMe && !(await canView(me, u)).ok) bits.push("Their posts are private.");
       else {
         const rest = tokens(q.replace(/@[a-z0-9_.]+/g, ""));
         let posts = await Post.find({ user: u._id }).populate("user", "username").sort({ createdAt: -1 }).limit(40);
@@ -646,6 +700,48 @@ router.post("/ai", auth, async (req, res) => {
   }
   reply = results.length ? `Here's what I found for “${q}”. Tap a result to open it.` : `I couldn't find anything for “${q}”. Try different words, switch the filter, or paste a @username.`;
   res.json({ reply, results, suggestions });
+});
+
+/* ================= LIKES / STORY REPLIES / SEARCH with block + private rules ================= */
+router.post("/posts/:id/like", auth, async (req, res) => {
+  if (!isId(req.params.id)) return res.status(404).json({ error: "Post not found." });
+  const p = await Post.findById(req.params.id);
+  if (!p) return res.status(404).json({ error: "Post not found." });
+  const owner = await User.findById(p.user);
+  if (!owner || !(await canView(req.user._id, owner)).ok) return res.status(403).json({ error: "You can't interact with this post." });
+  const i = p.likes.findIndex(x => S(x) === S(req.user._id));
+  if (i < 0) p.likes.push(req.user._id); else p.likes.splice(i, 1);
+  await p.save();
+  if (i < 0) await notify(req, { recipient: p.user, actor: req.user._id, type: "like", body: `${req.user.username} liked your post.`, post: p._id });
+  res.json({ likes: p.likes.length, likedByMe: i < 0 });
+});
+
+router.post("/stories/:id/reply", auth, async (req, res) => {
+  if (!isId(req.params.id)) return res.status(404).json({ error: "Story expired." });
+  const story = await Story.findById(req.params.id);
+  const text = clean(req.body?.text);
+  if (!story || story.expiresAt < new Date()) return res.status(404).json({ error: "Story expired." });
+  if (S(story.user) === S(req.user._id)) return res.status(400).json({ error: "You cannot reply to your own story." });
+  const owner = await User.findById(story.user);
+  if (!owner || !(await canView(req.user._id, owner)).ok) return res.status(403).json({ error: "You can't reply to this story." });
+  if (!text || text.length > 1000) return res.status(400).json({ error: "Enter a reply." });
+  const m = await Message.create({ from: req.user._id, to: story.user, text, storyReply: { story: story._id, media: story.media, text: story.text, expiresAt: story.expiresAt } });
+  await notify(req, { recipient: story.user, actor: req.user._id, type: "story_reply", body: `${req.user.username} replied to your story.`, messageRef: m._id, story: story._id });
+  const evt = { id: S(m._id), from: S(req.user._id), to: S(story.user) };
+  emit(req, story.user, "message:new", evt); emit(req, req.user._id, "message:new", evt);
+  res.json({ ok: true });
+});
+
+router.get("/search", auth, async (req, res) => {
+  const q = clean(req.query.q);
+  if (q.length < 2) return res.json({ users: [], posts: [] });
+  const r = new RegExp(rx(q), "i");
+  const [hidden, b1, b2] = await Promise.all([hiddenUsers(req.user), Block.find({ blocker: req.user._id }).distinct("blocked"), Block.find({ blocked: req.user._id }).distinct("blocker")]);
+  const [users, posts] = await Promise.all([
+    User.find({ emailVerified: true, _id: { $nin: [...b1, ...b2] }, $or: [{ username: r }, { bizName: r }, { displayName: r }] }).limit(15),
+    Post.find({ user: { $nin: hidden }, text: r }).populate("user").sort({ createdAt: -1 }).limit(20)
+  ]);
+  res.json({ users: users.map(publicUser), posts: posts.filter(p => p.user).map(p => ({ id: S(p._id), text: p.text, user: publicUser(p.user) })) });
 });
 
 /* ================= ADMIN: toggle the verified badge (any user) ================= */
