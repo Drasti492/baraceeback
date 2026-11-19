@@ -46,6 +46,7 @@ app.use("/api/auth", rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHe
 
 // extras FIRST (new + fixed routes), then the original routes
 app.use("/api", require("./routes/social")); // auth, profiles, posts, comments, chat, bot
+app.use("/api/hookup", require("./routes/hookup")); // adults-only anonymous section
 app.use("/api", require("./routes/extras"));
 app.use("/api", require("./routes/api"));
 
